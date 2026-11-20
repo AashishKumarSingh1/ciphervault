@@ -12,6 +12,7 @@ import {
   Settings,
   LogOut,
   Lock,
+  PlaySquare,
 } from "lucide-react";
 import { api } from "@/lib/api";
 
@@ -19,6 +20,7 @@ const navItems = [
   { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { name: "Secure Records", href: "/records", icon: Database },
   { name: "Encryption Lab", href: "/encryption-lab", icon: Cpu },
+  { name: "AES Simulator", href: "/simulator", icon: PlaySquare },
   { name: "Performance Lab", href: "/performance", icon: BarChart3 },
   { name: "Security Center", href: "/security", icon: ShieldAlert },
   { name: "Settings", href: "/settings", icon: Settings },
