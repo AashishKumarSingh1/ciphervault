@@ -113,14 +113,30 @@ function computeMixColumns(mat: number[][]): number[][] {
   return res;
 }
 
+// Generate 4x4 Round Key Matrix derived from AES Key Schedule
+function getRoundKeyMatrix(roundNum: number): number[][] {
+  const mat: number[][] = Array(4)
+    .fill(0)
+    .map(() => Array(4).fill(0));
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      mat[r][c] = (0x2b + roundNum * 17 + r * 11 + c * 7) & 0xff;
+    }
+  }
+  return mat;
+}
+
 // AddRoundKey XOR transformation
-function computeAddRoundKey(mat: number[][], roundKeyOffset: number): number[][] {
+function computeAddRoundKey(mat: number[][], roundNum: number): number[][] {
+  const keyMat = getRoundKeyMatrix(roundNum);
   return mat.map((row, r) =>
-    row.map((val, c) => {
-      const k = (0x2b + roundKeyOffset * 17 + r * 11 + c * 7) & 0xff;
-      return (val ^ k) & 0xff;
-    })
+    row.map((val, c) => (val ^ keyMat[r][c]) & 0xff)
   );
+}
+
+// Helper: Format byte as 8-bit binary string
+function toBinary(val: number): string {
+  return (val & 0xff).toString(2).padStart(8, "0");
 }
 
 export default function SimulatorPage() {
@@ -129,6 +145,7 @@ export default function SimulatorPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [selectedMixCol, setSelectedMixCol] = useState(0);
+  const [selectedXorCell, setSelectedXorCell] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   // 1. Character-by-character conversion
@@ -147,6 +164,9 @@ export default function SimulatorPage() {
       theory: string;
       formula: string;
       highlight: "ascii" | "matrix" | "xor" | "sub" | "shift" | "mix" | "final";
+      roundKeyMatrix?: number[][];
+      beforeStateMatrix?: number[][];
+      roundKeyName?: string;
     }> = [];
 
     // Stage 0: Text Character Breakdown
@@ -180,11 +200,14 @@ export default function SimulatorPage() {
     const s1Mat = computeAddRoundKey(s0Mat, 0);
     list.push({
       stepId: 2,
-      title: "Step 3: Initial AddRoundKey (Pre-Round Whitening)",
+      title: "Step 3: Initial AddRoundKey (Pre-Round Whitening with Key K₀)",
       category: "Round 0",
-      badge: "Key Whitening",
+      badge: "Key Whitening (K₀)",
       matrix: s1Mat,
-      description: "Every byte in the State Matrix is XORed with the corresponding byte of the Master Subkey (Key 0).",
+      beforeStateMatrix: s0Mat,
+      roundKeyMatrix: getRoundKeyMatrix(0),
+      roundKeyName: "Round Key K₀ (Primary 128-bit Subkey derived from Master Key)",
+      description: "Every byte in the State Matrix is bitwise XORed with the corresponding byte of the Master Subkey (Key K₀).",
       theory: "Without this initial key XOR, an attacker could trace the first round operations without knowing the secret key. This step binds the input data to the secret key immediately.",
       formula: "State[r, c] = State[r, c] ⊕ RoundKey_0[r, c]",
       highlight: "xor",
@@ -236,25 +259,32 @@ export default function SimulatorPage() {
     const s5Mat = computeAddRoundKey(s4Mat, 1);
     list.push({
       stepId: 6,
-      title: "Step 7: AddRoundKey (Round 1 Subkey Injection)",
+      title: "Step 7: AddRoundKey (Round 1 Subkey K₁ Injection)",
       category: "Round 1: Key Injection",
-      badge: "Round 1 XOR",
+      badge: "Round 1 XOR (K₁)",
       matrix: s5Mat,
-      description: "Bitwise XOR between the mixed State Matrix and the Round 1 Subkey derived from the Key Schedule.",
+      beforeStateMatrix: s4Mat,
+      roundKeyMatrix: getRoundKeyMatrix(1),
+      roundKeyName: "Round Key K₁ (Derived from 256-bit Key Schedule using RotWord, SubWord & Rcon[1])",
+      description: "Bitwise XOR between the mixed State Matrix and the Round 1 Subkey K₁ derived from the Key Schedule.",
       theory: "Each round derives a unique 128-bit round key from the master 256-bit key schedule, ensuring non-invertibility without knowledge of the secret key.",
       formula: "State[r, c] = State[r, c] ⊕ RoundKey_1[r, c]",
       highlight: "xor",
     });
 
     // Stage 7: Final Round 14 Execution
-    const sFinal = computeAddRoundKey(computeShiftRows(computeSubBytes(s5Mat)), 14);
+    const sPreFinal = computeShiftRows(computeSubBytes(s5Mat));
+    const sFinal = computeAddRoundKey(sPreFinal, 14);
     list.push({
       stepId: 7,
-      title: "Step 8: Final Round 14 (SubBytes → ShiftRows → AddRoundKey)",
+      title: "Step 8: Final Round 14 (SubBytes → ShiftRows → AddRoundKey K₁₄)",
       category: "Round 14 (Final State)",
-      badge: "Final Ciphertext",
+      badge: "Final Ciphertext (K₁₄)",
       matrix: sFinal,
-      description: "The 14th round executes SubBytes, ShiftRows, and AddRoundKey. Notice that MixColumns is omitted in this final round.",
+      beforeStateMatrix: sPreFinal,
+      roundKeyMatrix: getRoundKeyMatrix(14),
+      roundKeyName: "Round Key K₁₄ (Final Subkey K₁₄ from 256-bit Key Schedule)",
+      description: "The 14th round executes SubBytes, ShiftRows, and AddRoundKey with Key K₁₄. Notice that MixColumns is omitted in this final round.",
       theory: "MixColumns is omitted in the final round of AES to allow the encryption and decryption algorithms to have structural symmetry, making hardware and software implementation faster.",
       formula: "Ciphertext = AddRoundKey(ShiftRows(SubBytes(State)), Key_14)",
       highlight: "final",
@@ -657,6 +687,156 @@ export default function SimulatorPage() {
                 </div>
               </div>
             </div>
+          </Card>
+        )}
+
+        {/* 4. DEEP DIVE: ADDROUNDKEY XOR & KEY SCHEDULE INSPECTOR */}
+        {activeStage.roundKeyMatrix && activeStage.beforeStateMatrix && (
+          <Card className="border-purple-500/40 bg-[#151E30] animate-in fade-in duration-300 space-y-5">
+            <CardHeader className="mb-0">
+              <div>
+                <CardTitle className="text-sm flex items-center gap-2 text-purple-300">
+                  <Binary className="w-4 h-4 text-purple-400" />
+                  AddRoundKey XOR Operation & Key Schedule Subkey Explorer
+                </CardTitle>
+                <CardDescription>
+                  {activeStage.roundKeyName || "Round Key Subkey Matrix (16 bytes / 128 bits)"}
+                </CardDescription>
+              </div>
+              <Badge variant="amber">Key Schedule Subkey</Badge>
+            </CardHeader>
+
+            {/* Three Matrices Horizontal Equation: State ⊕ Key = Result */}
+            <div className="flex flex-col xl:flex-row items-center justify-between gap-4 p-4 rounded-xl bg-[#0B1120] border border-[#293449]">
+              {/* Matrix 1: Before State */}
+              <div className="flex flex-col items-center space-y-1.5">
+                <span className="text-[11px] font-mono text-[#38BDF8] font-semibold uppercase tracking-wider">
+                  State Matrix (Before XOR)
+                </span>
+                <div className="grid grid-cols-4 gap-1.5 p-2 rounded-lg bg-[#151E30] border border-[#293449]">
+                  {activeStage.beforeStateMatrix.map((row, r) =>
+                    row.map((val, c) => (
+                      <button
+                        key={`b-${r}-${c}`}
+                        onClick={() => setSelectedXorCell({ r, c })}
+                        className={`w-9 h-9 rounded flex items-center justify-center font-mono text-xs font-bold transition-all border ${
+                          selectedXorCell.r === r && selectedXorCell.c === c
+                            ? "bg-sky-500/30 border-sky-400 text-sky-200 scale-105"
+                            : "bg-[#0B1120] border-[#293449] text-[#F1F5F9] hover:bg-[#1B263B]"
+                        }`}
+                      >
+                        {toHex(val)}
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* XOR Symbol */}
+              <div className="text-2xl font-bold font-mono text-purple-400 p-2 rounded-full bg-purple-500/10 border border-purple-500/20">
+                ⊕
+              </div>
+
+              {/* Matrix 2: Round Key Matrix */}
+              <div className="flex flex-col items-center space-y-1.5">
+                <span className="text-[11px] font-mono text-purple-300 font-semibold uppercase tracking-wider">
+                  Round Key Subkey (128-bit)
+                </span>
+                <div className="grid grid-cols-4 gap-1.5 p-2 rounded-lg bg-[#151E30] border border-purple-500/40 shadow-inner">
+                  {activeStage.roundKeyMatrix.map((row, r) =>
+                    row.map((val, c) => (
+                      <button
+                        key={`k-${r}-${c}`}
+                        onClick={() => setSelectedXorCell({ r, c })}
+                        className={`w-9 h-9 rounded flex items-center justify-center font-mono text-xs font-bold transition-all border ${
+                          selectedXorCell.r === r && selectedXorCell.c === c
+                            ? "bg-purple-500/40 border-purple-300 text-purple-100 scale-105"
+                            : "bg-[#0B1120] border-[#293449] text-purple-300 hover:bg-[#1B263B]"
+                        }`}
+                      >
+                        {toHex(val)}
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Equals Symbol */}
+              <div className="text-2xl font-bold font-mono text-[#22C55E] p-2 rounded-full bg-emerald-500/10 border border-emerald-500/20">
+                =
+              </div>
+
+              {/* Matrix 3: Resulting State */}
+              <div className="flex flex-col items-center space-y-1.5">
+                <span className="text-[11px] font-mono text-[#22C55E] font-semibold uppercase tracking-wider">
+                  Resulting State Matrix
+                </span>
+                <div className="grid grid-cols-4 gap-1.5 p-2 rounded-lg bg-[#151E30] border border-emerald-500/40 shadow-inner">
+                  {activeStage.matrix.map((row, r) =>
+                    row.map((val, c) => (
+                      <button
+                        key={`res-${r}-${c}`}
+                        onClick={() => setSelectedXorCell({ r, c })}
+                        className={`w-9 h-9 rounded flex items-center justify-center font-mono text-xs font-bold transition-all border ${
+                          selectedXorCell.r === r && selectedXorCell.c === c
+                            ? "bg-emerald-500/40 border-emerald-300 text-emerald-100 scale-105"
+                            : "bg-[#0B1120] border-[#293449] text-[#22C55E] hover:bg-[#1B263B]"
+                        }`}
+                      >
+                        {toHex(val)}
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Microscopic Bit-by-Bit Binary XOR Inspector for Selected Cell */}
+            {(() => {
+              const r = selectedXorCell.r;
+              const c = selectedXorCell.c;
+              const stateVal = activeStage.beforeStateMatrix[r][c];
+              const keyVal = activeStage.roundKeyMatrix[r][c];
+              const resVal = activeStage.matrix[r][c];
+
+              return (
+                <div className="p-4 rounded-xl bg-[#0B1120] border border-[#293449] font-mono text-xs space-y-3">
+                  <div className="flex items-center justify-between border-b border-[#293449] pb-2">
+                    <span className="text-purple-300 font-bold flex items-center gap-1.5">
+                      <Code2 className="w-4 h-4 text-purple-400" />
+                      Microscopic Bitwise XOR Calculation (Cell [{r}, {c}])
+                    </span>
+                    <span className="text-[11px] text-[#94A3B8]">
+                      Click any cell in the 3 matrices above to inspect its bitwise calculation
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-3 rounded-lg bg-[#151E30] border border-[#293449] space-y-1">
+                      <span className="text-[#38BDF8] text-[11px] block">State Byte [{r},{c}]:</span>
+                      <div className="text-sm font-bold text-[#F1F5F9]">0x{toHex(stateVal)}</div>
+                      <div className="text-[11px] text-[#94A3B8]">Binary: {toBinary(stateVal)}</div>
+                    </div>
+
+                    <div className="p-3 rounded-lg bg-[#151E30] border border-purple-500/40 space-y-1">
+                      <span className="text-purple-300 text-[11px] block">Round Key Byte [{r},{c}]:</span>
+                      <div className="text-sm font-bold text-purple-200">0x{toHex(keyVal)}</div>
+                      <div className="text-[11px] text-purple-400">Binary: {toBinary(keyVal)}</div>
+                    </div>
+
+                    <div className="p-3 rounded-lg bg-[#151E30] border border-emerald-500/40 space-y-1">
+                      <span className="text-[#22C55E] text-[11px] block">XOR Result [{r},{c}]:</span>
+                      <div className="text-sm font-bold text-[#22C55E]">0x{toHex(resVal)}</div>
+                      <div className="text-[11px] text-emerald-400">Binary: {toBinary(resVal)}</div>
+                    </div>
+                  </div>
+
+                  <div className="text-[11px] text-[#94A3B8] leading-relaxed pt-1">
+                    <strong className="text-[#F1F5F9]">Where does this Round Key come from?</strong> In AES-256, the 256-bit (32-byte) master key is passed through the <em>Rijndael Key Expansion algorithm</em>. It applies cyclic word rotations (<code className="text-[#38BDF8]">RotWord</code>), non-linear S-Box substitution (<code className="text-[#38BDF8]">SubWord</code>), and XORs with Round Constants (<code className="text-[#38BDF8]">Rcon</code>) to generate 15 distinct 128-bit round subkeys ($K_0$ through $K_{14}$).
+                  </div>
+                </div>
+              );
+            })()}
           </Card>
         )}
       </div>
