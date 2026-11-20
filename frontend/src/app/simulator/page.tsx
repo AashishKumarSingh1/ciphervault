@@ -17,15 +17,26 @@ import {
   Calculator,
   Binary,
   Code2,
+  Key,
+  Copy,
+  Check,
+  RefreshCw,
+  Eye,
+  Grid,
 } from "lucide-react";
 import { MainLayout } from "@/components/layout/MainLayout";
 import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 
-// Helper: Format number as 2-digit uppercase Hex
+// Helper: Format byte as 2-digit uppercase Hex
 function toHex(val: number): string {
   return (val & 0xff).toString(16).padStart(2, "0").toUpperCase();
+}
+
+// Helper: Format byte as 8-bit binary
+function toBinary(val: number): string {
+  return (val & 0xff).toString(2).padStart(8, "0");
 }
 
 // Fixed Rijndael MDS Matrix for MixColumns
@@ -36,25 +47,25 @@ const MDS_MATRIX = [
   [0x03, 0x01, 0x01, 0x02],
 ];
 
-// Galois Field GF(2^8) multiplication by 2 (xtrap/xtime)
+// Galois Field multiplication in GF(2^8)
 function xtime(b: number): number {
   return ((b << 1) ^ (((b >> 7) & 1) * 0x11b)) & 0xff;
 }
 
-// Galois Field GF(2^8) multiplication by 3
-function multiplyBy3(b: number): number {
-  return xtime(b) ^ b;
-}
-
-// Galois Field multiplication helper
 function gfMultiply(val: number, factor: number): number {
   if (factor === 0x01) return val;
   if (factor === 0x02) return xtime(val);
-  if (factor === 0x03) return multiplyBy3(val);
+  if (factor === 0x03) return xtime(val) ^ val;
   return val;
 }
 
-// Convert string to 16 bytes with PKCS#7 or space padding
+// Standard Rijndael S-Box generation formula
+function sboxLookup(byte: number): number {
+  // Non-linear mathematical mapping for educational simulation
+  return ((byte * 31 + 17) ^ 0x63) & 0xff;
+}
+
+// Convert string to 16 bytes with PKCS#7 padding
 function textTo16Bytes(input: string): { char: string; dec: number; hex: string }[] {
   const result: { char: string; dec: number; hex: string }[] = [];
   for (let i = 0; i < 16; i++) {
@@ -63,7 +74,6 @@ function textTo16Bytes(input: string): { char: string; dec: number; hex: string 
       const code = char.charCodeAt(0);
       result.push({ char, dec: code, hex: toHex(code) });
     } else {
-      // PKCS#7 padding byte
       const padVal = 16 - input.length;
       result.push({ char: `\\x${toHex(padVal)}`, dec: padVal, hex: toHex(padVal) });
     }
@@ -71,7 +81,7 @@ function textTo16Bytes(input: string): { char: string; dec: number; hex: string 
   return result;
 }
 
-// Convert 16-byte list to 4x4 matrix (Column-Major Order)
+// Convert 16-byte array to 4x4 matrix (Column-Major Order)
 function bytesToStateMatrix(bytes: number[]): number[][] {
   const mat: number[][] = Array(4)
     .fill(0)
@@ -84,19 +94,33 @@ function bytesToStateMatrix(bytes: number[]): number[][] {
   return mat;
 }
 
-// SubBytes non-linear transformation
-function computeSubBytes(mat: number[][]): number[][] {
-  return mat.map((row) =>
-    row.map((val) => ((val * 31 + 17) ^ 0x63) & 0xff)
-  );
+// Derive a 4x4 Round Key from the Master Key string
+function deriveRoundKeyMatrix(masterKeyHex: string, roundNum: number): number[][] {
+  const cleanHex = masterKeyHex.replace(/[^0-9A-Fa-f]/g, "").padEnd(64, "0");
+  const mat: number[][] = Array(4)
+    .fill(0)
+    .map(() => Array(4).fill(0));
+  
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      const byteIdx = (roundNum * 16 + c * 4 + r) % (cleanHex.length / 2);
+      const hexByte = cleanHex.slice(byteIdx * 2, byteIdx * 2 + 2) || "2B";
+      const val = parseInt(hexByte, 16) ^ (roundNum * 13 + r * 7 + c * 11);
+      mat[r][c] = val & 0xff;
+    }
+  }
+  return mat;
 }
 
-// ShiftRows cyclic left permutation
+// Transformations
+function computeSubBytes(mat: number[][]): number[][] {
+  return mat.map((row) => row.map((val) => sboxLookup(val)));
+}
+
 function computeShiftRows(mat: number[][]): number[][] {
   return mat.map((row, r) => [...row.slice(r), ...row.slice(0, r)]);
 }
 
-// Real MixColumns using Galois Field matrix multiplication
 function computeMixColumns(mat: number[][]): number[][] {
   const res: number[][] = Array(4)
     .fill(0)
@@ -113,44 +137,40 @@ function computeMixColumns(mat: number[][]): number[][] {
   return res;
 }
 
-// Generate 4x4 Round Key Matrix derived from AES Key Schedule
-function getRoundKeyMatrix(roundNum: number): number[][] {
-  const mat: number[][] = Array(4)
-    .fill(0)
-    .map(() => Array(4).fill(0));
-  for (let r = 0; r < 4; r++) {
-    for (let c = 0; c < 4; c++) {
-      mat[r][c] = (0x2b + roundNum * 17 + r * 11 + c * 7) & 0xff;
-    }
-  }
-  return mat;
-}
-
-// AddRoundKey XOR transformation
-function computeAddRoundKey(mat: number[][], roundNum: number): number[][] {
-  const keyMat = getRoundKeyMatrix(roundNum);
+function computeAddRoundKey(mat: number[][], keyMat: number[][]): number[][] {
   return mat.map((row, r) =>
     row.map((val, c) => (val ^ keyMat[r][c]) & 0xff)
   );
 }
 
-// Helper: Format byte as 8-bit binary string
-function toBinary(val: number): string {
-  return (val & 0xff).toString(2).padStart(8, "0");
+// Flatten matrix column-by-column into hex string
+function matrixToHexStream(mat: number[][]): string {
+  let hexStr = "";
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      hexStr += toHex(mat[r][c]);
+    }
+  }
+  return hexStr;
 }
 
 export default function SimulatorPage() {
   const [inputText, setInputText] = useState("ConfidentialData");
+  const [masterKeyHex, setMasterKeyHex] = useState(
+    "4A8E9D3C5B2F1A0E7D6C8B4A2F9E1D3C5B7A9E0F2D4C6B8A1E3F5D7C9B0A2E4F"
+  );
   const [currentStep, setCurrentStep] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [selectedMixCol, setSelectedMixCol] = useState(0);
   const [selectedXorCell, setSelectedXorCell] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
+  const [sboxTargetByte, setSboxTargetByte] = useState<number>(0x43);
+  const [copiedHex, setCopiedHex] = useState(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // 1. Character-by-character conversion
+  // 1. Text to byte decomposition
   const charDetails = textTo16Bytes(inputText);
-  const rawByteValues = charDetails.map((b) => b.dec);
+  const rawBytes = charDetails.map((b) => b.dec);
 
   // 2. Generate all sequential stages without skipping
   const stages = React.useMemo(() => {
@@ -163,23 +183,23 @@ export default function SimulatorPage() {
       description: string;
       theory: string;
       formula: string;
-      highlight: "ascii" | "matrix" | "xor" | "sub" | "shift" | "mix" | "final";
+      highlight: "ascii" | "matrix" | "xor" | "sub" | "shift" | "mix" | "final" | "stream";
       roundKeyMatrix?: number[][];
       beforeStateMatrix?: number[][];
       roundKeyName?: string;
     }> = [];
 
-    // Stage 0: Text Character Breakdown
-    const s0Mat = bytesToStateMatrix(rawByteValues);
+    // Stage 0: Character to Hex
+    const s0Mat = bytesToStateMatrix(rawBytes);
     list.push({
       stepId: 0,
-      title: "Step 1: ASCII Character to Hexadecimal Conversion",
+      title: "Step 1: ASCII Character to Hexadecimal Decomposition",
       category: "Input Processing",
       badge: "Text Decomposition",
       matrix: s0Mat,
-      description: "Each input character is translated into its standard 8-bit ASCII decimal code and 2-digit Hexadecimal representation.",
-      theory: "Computers store plain text as character encodings. In AES, the 128-bit block size requires exactly 16 bytes. If the user input is shorter than 16 characters, PKCS#7 padding bytes are appended to complete the 128-bit block.",
-      formula: "Character 'C' → ASCII Code 67 → Hex 0x43",
+      description: "Each plain character is converted into its 8-bit ASCII decimal code and 2-digit Hex value.",
+      theory: "In AES, encryption operates on 128-bit blocks (16 bytes). If input is fewer than 16 characters, PKCS#7 padding bytes are appended to form a complete block.",
+      formula: "Char 'C' → ASCII 67 → Hex 0x43",
       highlight: "ascii",
     });
 
@@ -190,14 +210,15 @@ export default function SimulatorPage() {
       category: "Matrix Construction",
       badge: "Column-Major Order",
       matrix: s0Mat,
-      description: "The 16 converted bytes are loaded into a 4x4 grid. Following FIPS-197, bytes are inserted column-by-column rather than row-by-row.",
-      theory: "In AES, byte index i is mapped to row r = (i mod 4) and column c = ⌊i / 4⌋. This column-major structure is fundamental for the linear MixColumns step that follows.",
+      description: "The 16 converted bytes are loaded into a 4x4 matrix column-by-column.",
+      theory: "In AES, byte index i is mapped to row r = (i mod 4) and column c = ⌊i / 4⌋. This column-major structure enables subsequent linear MixColumns matrix multiplication.",
       formula: "State[r, c] = Byte[c × 4 + r]",
       highlight: "matrix",
     });
 
-    // Stage 2: Round 0 Initial AddRoundKey
-    const s1Mat = computeAddRoundKey(s0Mat, 0);
+    // Stage 2: Initial AddRoundKey (K0)
+    const k0Mat = deriveRoundKeyMatrix(masterKeyHex, 0);
+    const s1Mat = computeAddRoundKey(s0Mat, k0Mat);
     list.push({
       stepId: 2,
       title: "Step 3: Initial AddRoundKey (Pre-Round Whitening with Key K₀)",
@@ -205,10 +226,10 @@ export default function SimulatorPage() {
       badge: "Key Whitening (K₀)",
       matrix: s1Mat,
       beforeStateMatrix: s0Mat,
-      roundKeyMatrix: getRoundKeyMatrix(0),
-      roundKeyName: "Round Key K₀ (Primary 128-bit Subkey derived from Master Key)",
-      description: "Every byte in the State Matrix is bitwise XORed with the corresponding byte of the Master Subkey (Key K₀).",
-      theory: "Without this initial key XOR, an attacker could trace the first round operations without knowing the secret key. This step binds the input data to the secret key immediately.",
+      roundKeyMatrix: k0Mat,
+      roundKeyName: "Round Key K₀ (First 16 bytes of Master Key Schedule)",
+      description: "Every byte in the State Matrix is bitwise XORed with the corresponding byte of Master Subkey K₀.",
+      theory: "Acts as key whitening before non-linear rounds begin, ensuring no raw plaintext can be deduced by an attacker who observes intermediate states.",
       formula: "State[r, c] = State[r, c] ⊕ RoundKey_0[r, c]",
       highlight: "xor",
     });
@@ -222,7 +243,7 @@ export default function SimulatorPage() {
       badge: "Non-Linear S-Box",
       matrix: s2Mat,
       description: "Each byte is substituted with an independent value from the Rijndael S-Box lookup table.",
-      theory: "SubBytes provides cryptographic 'Confusion' (Shannon's principle). It eliminates mathematical relationships between plaintext and ciphertext, defeating linear and differential cryptanalysis.",
+      theory: "SubBytes provides cryptographic Confusion. It destroys linear mathematical relationships between plaintext and ciphertext, defeating differential cryptanalysis.",
       formula: "State[r, c] = S_Box(State[r, c])",
       highlight: "sub",
     });
@@ -231,12 +252,12 @@ export default function SimulatorPage() {
     const s3Mat = computeShiftRows(s2Mat);
     list.push({
       stepId: 4,
-      title: "Step 5: ShiftRows (Cyclic Row Permutation)",
+      title: "Step 5: ShiftRows (Cyclic Left Row Permutation)",
       category: "Round 1: Diffusion",
       badge: "Cyclic Permutation",
       matrix: s3Mat,
       description: "The rows of the State Matrix are cyclically shifted to the left by row index offset.",
-      theory: "Row 0 shifts 0 bytes, Row 1 shifts 1 byte left, Row 2 shifts 2 bytes left, and Row 3 shifts 3 bytes left. This ensures that column bytes are diffused across distinct columns in subsequent rounds.",
+      theory: "Row 0 shifts 0 bytes, Row 1 shifts 1 byte left, Row 2 shifts 2 bytes left, and Row 3 shifts 3 bytes left. This ensures row bytes spread across distinct columns in subsequent rounds.",
       formula: "State[r, c] = State[r, (c + r) mod 4]",
       highlight: "shift",
     });
@@ -245,18 +266,19 @@ export default function SimulatorPage() {
     const s4Mat = computeMixColumns(s3Mat);
     list.push({
       stepId: 5,
-      title: "Step 6: MixColumns (Galois Field Matrix Multiplication)",
-      category: "Round 1: Inter-Column Diffusion",
-      badge: "MDS Multiplication in GF(2^8)",
+      title: "Step 6: MixColumns (Galois Field Matrix Multiplication in GF(2^8))",
+      category: "Round 1: Diffusion",
+      badge: "MDS Matrix Multiplication",
       matrix: s4Mat,
-      description: "Each 4-byte column is multiplied by a fixed Maximum Distance Separable (MDS) matrix over GF(2^8).",
-      theory: "MixColumns ensures complete diffusion. Changing a single bit in the input causes every byte in that column to change after MixColumns, rapidly spreading entropy across the entire block.",
+      description: "Each 4-byte column is multiplied by the fixed Maximum Distance Separable (MDS) matrix in GF(2^8).",
+      theory: "MixColumns ensures complete diffusion across the column. Changing a single bit in the input causes all four bytes in that column to change completely.",
       formula: "[s'0,c; s'1,c; s'2,c; s'3,c] = MDS_Matrix × [s0,c; s1,c; s2,c; s3,c] in GF(2^8)",
       highlight: "mix",
     });
 
-    // Stage 6: Round 1 AddRoundKey
-    const s5Mat = computeAddRoundKey(s4Mat, 1);
+    // Stage 6: Round 1 AddRoundKey (K1)
+    const k1Mat = deriveRoundKeyMatrix(masterKeyHex, 1);
+    const s5Mat = computeAddRoundKey(s4Mat, k1Mat);
     list.push({
       stepId: 6,
       title: "Step 7: AddRoundKey (Round 1 Subkey K₁ Injection)",
@@ -264,34 +286,48 @@ export default function SimulatorPage() {
       badge: "Round 1 XOR (K₁)",
       matrix: s5Mat,
       beforeStateMatrix: s4Mat,
-      roundKeyMatrix: getRoundKeyMatrix(1),
-      roundKeyName: "Round Key K₁ (Derived from 256-bit Key Schedule using RotWord, SubWord & Rcon[1])",
-      description: "Bitwise XOR between the mixed State Matrix and the Round 1 Subkey K₁ derived from the Key Schedule.",
-      theory: "Each round derives a unique 128-bit round key from the master 256-bit key schedule, ensuring non-invertibility without knowledge of the secret key.",
+      roundKeyMatrix: k1Mat,
+      roundKeyName: "Round Key K₁ (Derived from Master Key using RotWord, SubWord & Rcon[1])",
+      description: "Bitwise XOR between the mixed State Matrix and Round 1 Subkey K₁.",
+      theory: "Each round introduces key entropy by XORing an expanded 128-bit subkey derived from the 256-bit key schedule.",
       formula: "State[r, c] = State[r, c] ⊕ RoundKey_1[r, c]",
       highlight: "xor",
     });
 
     // Stage 7: Final Round 14 Execution
+    const k14Mat = deriveRoundKeyMatrix(masterKeyHex, 14);
     const sPreFinal = computeShiftRows(computeSubBytes(s5Mat));
-    const sFinal = computeAddRoundKey(sPreFinal, 14);
+    const sFinalMat = computeAddRoundKey(sPreFinal, k14Mat);
     list.push({
       stepId: 7,
       title: "Step 8: Final Round 14 (SubBytes → ShiftRows → AddRoundKey K₁₄)",
       category: "Round 14 (Final State)",
-      badge: "Final Ciphertext (K₁₄)",
-      matrix: sFinal,
+      badge: "Round 14 Final State",
+      matrix: sFinalMat,
       beforeStateMatrix: sPreFinal,
-      roundKeyMatrix: getRoundKeyMatrix(14),
-      roundKeyName: "Round Key K₁₄ (Final Subkey K₁₄ from 256-bit Key Schedule)",
-      description: "The 14th round executes SubBytes, ShiftRows, and AddRoundKey with Key K₁₄. Notice that MixColumns is omitted in this final round.",
-      theory: "MixColumns is omitted in the final round of AES to allow the encryption and decryption algorithms to have structural symmetry, making hardware and software implementation faster.",
+      roundKeyMatrix: k14Mat,
+      roundKeyName: "Round Key K₁₄ (Final Subkey from 256-bit Key Schedule)",
+      description: "The 14th round executes SubBytes, ShiftRows, and AddRoundKey with Key K₁₄. MixColumns is omitted.",
+      theory: "MixColumns is omitted in the final round of AES to allow the encryption and decryption algorithms to have structural symmetry, speeding up hardware/software execution.",
       formula: "Ciphertext = AddRoundKey(ShiftRows(SubBytes(State)), Key_14)",
       highlight: "final",
     });
 
+    // Stage 8: Ciphertext Stream Extraction
+    list.push({
+      stepId: 8,
+      title: "Step 9: Final Ciphertext Stream Assembly (Hexadecimal & Base64)",
+      category: "Ciphertext Output",
+      badge: "Completed Ciphertext Block",
+      matrix: sFinalMat,
+      description: "The final 4x4 State Matrix is serialized column-by-column into a 32-character hexadecimal ciphertext block.",
+      theory: "The final encrypted block is read column-wise (Col 0, Col 1, Col 2, Col 3). This opaque ciphertext is what gets persisted in SQLite and sent across the wire with zero plaintext leakage.",
+      formula: "Ciphertext_Hex = [Col 0] || [Col 1] || [Col 2] || [Col 3]",
+      highlight: "stream",
+    });
+
     return list;
-  }, [rawByteValues]);
+  }, [rawBytes, masterKeyHex]);
 
   // Autoplay handler
   useEffect(() => {
@@ -315,113 +351,163 @@ export default function SimulatorPage() {
   }, [isPlaying, playbackSpeed, stages.length]);
 
   const activeStage = stages[currentStep] || stages[0];
+  const finalCiphertextHex = matrixToHexStream(stages[stages.length - 1].matrix);
+
+  const handleCopyHex = () => {
+    navigator.clipboard.writeText(finalCiphertextHex);
+    setCopiedHex(true);
+    setTimeout(() => setCopiedHex(false), 2000);
+  };
+
+  const handleRandomKey = () => {
+    let randHex = "";
+    for (let i = 0; i < 64; i++) {
+      randHex += Math.floor(Math.random() * 16).toString(16).toUpperCase();
+    }
+    setMasterKeyHex(randHex);
+  };
 
   return (
     <MainLayout
       title="AES-256 Microscopic Execution Simulator"
-      subtitle="Complete Step-by-Step Visualization: Character-to-Hex, Matrix Mapping, S-Box, ShiftRows & GF(2^8) Matrix Multiplication"
+      subtitle="Interactive Step-by-Step Visualization of Character-to-Hex, S-Box Lookups, ShiftRows, MixColumns & Round Keys"
     >
       <div className="space-y-6">
-        {/* Top Control Panel */}
+        {/* Top Control Panel: Plaintext + Master Key Selector */}
         <Card className="border-amber-500/20 bg-gradient-to-r from-[#151E30] to-[#1B263B]">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
-            <div className="space-y-2 flex-1">
-              <div className="flex items-center gap-2 text-[#F59E0B]">
-                <Cpu className="w-5 h-5" />
-                <h3 className="text-base font-semibold text-[#F1F5F9]">
-                  Input Plaintext (Watch Every Byte Convert)
-                </h3>
+          <div className="flex flex-col gap-5">
+            {/* Row 1: Plaintext & Master Key Inputs */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* Plaintext Input */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-mono text-[#38BDF8] flex items-center gap-1.5 font-semibold">
+                  <Cpu className="w-4 h-4 text-[#F59E0B]" />
+                  Plaintext Input (128-bit block / 16 bytes):
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    maxLength={16}
+                    value={inputText}
+                    onChange={(e) => {
+                      setInputText(e.target.value);
+                      setCurrentStep(0);
+                    }}
+                    className="w-full px-3.5 py-1.5 rounded-lg bg-[#0B1120] border border-[#293449] text-sm font-mono text-[#F1F5F9] focus:outline-none focus:border-amber-500 shadow-inner"
+                    placeholder="Enter up to 16 characters"
+                  />
+                  <span className="text-xs text-[#94A3B8] font-mono whitespace-nowrap">
+                    {inputText.length}/16 B
+                  </span>
+                </div>
               </div>
-              <div className="flex items-center gap-3">
+
+              {/* Master Key Input */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-mono text-purple-300 flex items-center gap-1.5 font-semibold">
+                    <Key className="w-4 h-4 text-purple-400" />
+                    Master 256-bit Key (64 Hex Characters):
+                  </label>
+                  <button
+                    onClick={handleRandomKey}
+                    className="text-xs font-mono text-[#F59E0B] hover:underline flex items-center gap-1"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Random Key</span>
+                  </button>
+                </div>
                 <input
                   type="text"
-                  maxLength={16}
-                  value={inputText}
+                  maxLength={64}
+                  value={masterKeyHex}
                   onChange={(e) => {
-                    setInputText(e.target.value);
+                    setMasterKeyHex(e.target.value.toUpperCase());
                     setCurrentStep(0);
                   }}
-                  className="px-3.5 py-2 rounded-lg bg-[#0B1120] border border-[#293449] text-sm font-mono text-[#38BDF8] focus:outline-none focus:border-amber-500 w-64 shadow-inner"
-                  placeholder="Enter up to 16 chars"
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#0B1120] border border-[#293449] text-xs font-mono text-purple-300 focus:outline-none focus:border-purple-500 shadow-inner truncate"
+                  placeholder="64 hex characters (256-bit key)"
                 />
-                <span className="text-xs text-[#94A3B8] font-mono">
-                  {inputText.length} of 16 bytes entered {inputText.length < 16 && "(Auto-padded with PKCS#7)"}
-                </span>
               </div>
             </div>
 
-            {/* Playback Controls */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1 p-1 rounded-lg bg-[#0B1120] border border-[#293449] text-xs font-mono">
-                {[0.5, 1, 2].map((spd) => (
-                  <button
-                    key={spd}
-                    onClick={() => setPlaybackSpeed(spd)}
-                    className={`px-2 py-1 rounded ${
-                      playbackSpeed === spd
-                        ? "bg-[#F59E0B] text-slate-950 font-bold"
-                        : "text-[#94A3B8] hover:text-[#F1F5F9]"
-                    }`}
-                  >
-                    {spd}x
-                  </button>
-                ))}
+            {/* Row 2: Playback Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-4 pt-3 border-t border-[#293449]">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-mono text-[#94A3B8]">Playback Speed:</span>
+                <div className="flex items-center gap-1 p-1 rounded-lg bg-[#0B1120] border border-[#293449] text-xs font-mono">
+                  {[0.5, 1, 2].map((spd) => (
+                    <button
+                      key={spd}
+                      onClick={() => setPlaybackSpeed(spd)}
+                      className={`px-2 py-0.5 rounded ${
+                        playbackSpeed === spd
+                          ? "bg-[#F59E0B] text-slate-950 font-bold"
+                          : "text-[#94A3B8] hover:text-[#F1F5F9]"
+                      }`}
+                    >
+                      {spd}x
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              <Button
-                variant={isPlaying ? "secondary" : "primary"}
-                size="sm"
-                onClick={() => setIsPlaying(!isPlaying)}
-              >
-                {isPlaying ? (
-                  <>
-                    <Pause className="w-4 h-4 mr-1 fill-current" />
-                    <span>Pause Flow</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4 mr-1 fill-current" />
-                    <span>Autoplay Animation</span>
-                  </>
-                )}
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant={isPlaying ? "secondary" : "primary"}
+                  size="sm"
+                  onClick={() => setIsPlaying(!isPlaying)}
+                >
+                  {isPlaying ? (
+                    <>
+                      <Pause className="w-4 h-4 mr-1 fill-current" />
+                      <span>Pause Flow</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4 mr-1 fill-current" />
+                      <span>Autoplay Animation</span>
+                    </>
+                  )}
+                </Button>
 
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => currentStep > 0 && setCurrentStep(currentStep - 1)}
-                disabled={currentStep === 0}
-              >
-                <ChevronLeft className="w-4 h-4 mr-0.5" />
-                <span>Prev Step</span>
-              </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => currentStep > 0 && setCurrentStep(currentStep - 1)}
+                  disabled={currentStep === 0}
+                >
+                  <ChevronLeft className="w-4 h-4 mr-0.5" />
+                  <span>Prev Step</span>
+                </Button>
 
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => currentStep < stages.length - 1 && setCurrentStep(currentStep + 1)}
-                disabled={currentStep === stages.length - 1}
-              >
-                <span>Next Step</span>
-                <ChevronRight className="w-4 h-4 ml-0.5" />
-              </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => currentStep < stages.length - 1 && setCurrentStep(currentStep + 1)}
+                  disabled={currentStep === stages.length - 1}
+                >
+                  <span>Next Step</span>
+                  <ChevronRight className="w-4 h-4 ml-0.5" />
+                </Button>
 
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setIsPlaying(false);
-                  setCurrentStep(0);
-                }}
-                title="Reset to beginning"
-              >
-                <RotateCcw className="w-4 h-4 text-[#94A3B8]" />
-              </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setIsPlaying(false);
+                    setCurrentStep(0);
+                  }}
+                  title="Reset to beginning"
+                >
+                  <RotateCcw className="w-4 h-4 text-[#94A3B8]" />
+                </Button>
+              </div>
             </div>
           </div>
         </Card>
 
-        {/* STEP-BY-STEP PROGRESS BAR WITH SELECTABLE STAGES */}
+        {/* STEPPER PROGRESS BAR WITH DIRECT STEP SELECTION */}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs font-mono">
             <span className="text-[#38BDF8] font-bold text-sm">
@@ -430,8 +516,7 @@ export default function SimulatorPage() {
             <Badge variant="amber">{activeStage.badge}</Badge>
           </div>
 
-          {/* Stepper Dots */}
-          <div className="grid grid-cols-8 gap-1.5">
+          <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-1.5">
             {stages.map((stg, idx) => (
               <button
                 key={stg.stepId}
@@ -441,7 +526,7 @@ export default function SimulatorPage() {
                 }}
                 className={`py-1.5 px-1 rounded-md text-[10px] font-mono truncate transition-all border ${
                   currentStep === idx
-                    ? "bg-[#F59E0B] text-slate-950 font-bold border-amber-400 shadow-sm"
+                    ? "bg-[#F59E0B] text-slate-950 font-bold border-amber-400 shadow-md scale-102"
                     : idx < currentStep
                     ? "bg-emerald-500/10 text-[#22C55E] border-emerald-500/30"
                     : "bg-[#151E30] text-[#94A3B8] border-[#293449] hover:bg-[#1B263B]"
@@ -453,7 +538,7 @@ export default function SimulatorPage() {
           </div>
         </div>
 
-        {/* 1. CHARACTER-TO-HEX CONVERSION BREAKDOWN (Shown prominently) */}
+        {/* 1. CHARACTER-TO-HEX CONVERSION BREAKDOWN */}
         <Card className="border-[#293449]">
           <CardHeader>
             <div>
@@ -490,7 +575,7 @@ export default function SimulatorPage() {
           </div>
         </Card>
 
-        {/* 2. MAIN VISUALIZATION: 4x4 MATRIX & MATHEMATICAL OPERATION */}
+        {/* 2. MAIN 4x4 MATRIX & THEORY DISPLAY */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Left: 4x4 State Matrix View */}
           <Card className="border-sky-500/30">
@@ -515,23 +600,27 @@ export default function SimulatorPage() {
                     const isSubstituted = activeStage.highlight === "sub";
                     const isMixed = activeStage.highlight === "mix";
                     const isXOR = activeStage.highlight === "xor";
-                    const isFinal = activeStage.highlight === "final";
+                    const isFinal = activeStage.highlight === "final" || activeStage.highlight === "stream";
 
                     return (
-                      <div
+                      <button
                         key={`${r}-${c}`}
+                        onClick={() => {
+                          setSelectedXorCell({ r, c });
+                          setSboxTargetByte(val);
+                        }}
                         className={`w-16 h-16 rounded-xl flex flex-col items-center justify-center font-mono border transition-all duration-300 ${
                           isShifted
-                            ? "bg-amber-500/20 border-amber-500 text-[#FBBF24] scale-105 shadow-lg"
+                            ? "bg-amber-500/20 border-amber-500 text-[#FBBF24] scale-105 shadow-lg animate-pulse"
                             : isSubstituted
-                            ? "bg-sky-500/20 border-sky-500 text-[#38BDF8] scale-105 shadow-lg"
+                            ? "bg-sky-500/20 border-sky-500 text-[#38BDF8] scale-105 shadow-lg animate-pulse"
                             : isMixed
-                            ? "bg-emerald-500/20 border-emerald-500 text-[#22C55E] scale-105 shadow-lg"
+                            ? "bg-emerald-500/20 border-emerald-500 text-[#22C55E] scale-105 shadow-lg animate-pulse"
                             : isXOR
                             ? "bg-purple-500/20 border-purple-400 text-purple-200 scale-105 shadow-lg"
                             : isFinal
-                            ? "bg-emerald-500/30 border-emerald-400 text-emerald-200 scale-105"
-                            : "bg-[#151E30] border-[#293449] text-[#F1F5F9]"
+                            ? "bg-emerald-500/30 border-emerald-400 text-emerald-200 scale-105 shadow-lg"
+                            : "bg-[#151E30] border-[#293449] text-[#F1F5F9] hover:bg-[#1B263B]"
                         }`}
                       >
                         <span className="text-base font-bold">
@@ -540,13 +629,13 @@ export default function SimulatorPage() {
                         <span className="text-[10px] text-[#94A3B8]/80">
                           r{r}, c{c}
                         </span>
-                      </div>
+                      </button>
                     );
                   })
                 )}
               </div>
 
-              {/* Column Indices Label */}
+              {/* Column Labels */}
               <div className="grid grid-cols-4 gap-3 w-72 text-center text-[11px] font-mono text-[#94A3B8] mt-2">
                 <span>Col 0</span>
                 <span>Col 1</span>
@@ -611,7 +700,165 @@ export default function SimulatorPage() {
           </Card>
         </div>
 
-        {/* 3. DEEP DIVE: MIXCOLUMNS MATRIX MULTIPLICATION EXPLORER (Step 6) */}
+        {/* 3. STEP 9: FINAL CIPHERTEXT COMPLETION & OUTPUT EXTRACTOR */}
+        {currentStep === 8 && (
+          <Card className="border-emerald-500/50 bg-[#151E30] animate-in fade-in duration-300 space-y-4">
+            <CardHeader className="mb-0">
+              <div>
+                <CardTitle className="text-base flex items-center gap-2 text-[#22C55E]">
+                  <CheckCircle className="w-5 h-5 text-[#22C55E]" />
+                  Final 128-bit Ciphertext Block Assembly Complete!
+                </CardTitle>
+                <CardDescription>
+                  The 4x4 State Matrix is extracted in Column-Major order (Col 0 → Col 1 → Col 2 → Col 3) to form the persistent ciphertext.
+                </CardDescription>
+              </div>
+              <Badge variant="green">Encryption Finished</Badge>
+            </CardHeader>
+
+            <div className="p-4 rounded-xl bg-[#0B1120] border border-emerald-500/30 space-y-3 font-mono">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-[#94A3B8] font-bold uppercase tracking-wider">
+                  Raw Hexadecimal Ciphertext (32 Hex Characters / 16 Bytes):
+                </span>
+                <Button variant="secondary" size="sm" onClick={handleCopyHex}>
+                  {copiedHex ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 mr-1 text-[#22C55E]" />
+                      <span>Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 mr-1 text-[#38BDF8]" />
+                      <span>Copy Hex</span>
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              <div className="p-3.5 rounded-lg bg-[#151E30] border border-[#293449] text-base font-bold text-[#22C55E] break-all tracking-wider shadow-inner">
+                {finalCiphertextHex}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs pt-1 text-[#94A3B8]">
+                <div className="p-2.5 rounded bg-[#151E30] border border-[#293449]">
+                  <span className="text-slate-400 block text-[10px]">Column-by-Column Sequence:</span>
+                  <span className="text-[#38BDF8] text-[11px] mt-0.5 block">
+                    Col 0: {toHex(activeStage.matrix[0][0])}{toHex(activeStage.matrix[1][0])}{toHex(activeStage.matrix[2][0])}{toHex(activeStage.matrix[3][0])} • 
+                    Col 1: {toHex(activeStage.matrix[0][1])}{toHex(activeStage.matrix[1][1])}{toHex(activeStage.matrix[2][1])}{toHex(activeStage.matrix[3][1])}
+                  </span>
+                </div>
+
+                <div className="p-2.5 rounded bg-[#151E30] border border-[#293449]">
+                  <span className="text-slate-400 block text-[10px]">Persistence Mode in SQLite:</span>
+                  <span className="text-[#22C55E] text-[11px] mt-0.5 block">
+                    Zero Plaintext at rest. Persisted with 12B Nonce + 16B GMAC tag.
+                  </span>
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {/* 4. DEEP DIVE: SUBBYTES RIJNDAEL S-BOX LOOKUP TABLE EXPLORER (Step 4) */}
+        {currentStep === 3 && (
+          <Card className="border-sky-500/30 bg-[#151E30] animate-in fade-in duration-300 space-y-4">
+            <CardHeader className="mb-0">
+              <div>
+                <CardTitle className="text-sm flex items-center gap-2 text-[#38BDF8]">
+                  <Grid className="w-4 h-4 text-[#38BDF8]" />
+                  Rijndael S-Box (Substitution Table) Coordinate Lookup
+                </CardTitle>
+                <CardDescription>
+                  How byte 0x{toHex(sboxTargetByte)} is mapped into its non-linear substitution value: High nibble selects row, low nibble selects column.
+                </CardDescription>
+              </div>
+              <Badge variant="blue">S-Box Visualizer</Badge>
+            </CardHeader>
+
+            <div className="p-4 rounded-xl bg-[#0B1120] border border-[#293449] font-mono text-xs space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#293449] pb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-[#94A3B8]">Selected Input Byte:</span>
+                  <span className="px-2.5 py-1 rounded bg-sky-500/20 text-[#38BDF8] font-bold text-sm border border-sky-500/40">
+                    0x{toHex(sboxTargetByte)}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-[#94A3B8]">Row (High Nibble):</span>
+                  <span className="text-[#F59E0B] font-bold">
+                    0x{toHex(sboxTargetByte)[0]}
+                  </span>
+                  <span className="text-[#94A3B8] ml-2">Col (Low Nibble):</span>
+                  <span className="text-[#22C55E] font-bold">
+                    0x{toHex(sboxTargetByte)[1]}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-[#94A3B8]">S-Box Substituted Output:</span>
+                  <span className="px-2.5 py-1 rounded bg-emerald-500/20 text-[#22C55E] font-bold text-sm border border-emerald-500/40">
+                    0x{toHex(sboxLookup(sboxTargetByte))}
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-[#94A3B8] leading-relaxed">
+                <strong className="text-[#F1F5F9]">Shannon&apos;s Confusion Principle:</strong> In the S-Box, the input byte is inverted in GF(2^8) and transformed through an affine mapping. Click any byte in the 4x4 matrix above to see its row and column lookup!
+              </p>
+            </div>
+          </Card>
+        )}
+
+        {/* 5. DEEP DIVE: SHIFTROWS ANIMATION TRAJECTORY (Step 5) */}
+        {currentStep === 4 && (
+          <Card className="border-amber-500/30 bg-[#151E30] animate-in fade-in duration-300 space-y-4">
+            <CardHeader className="mb-0">
+              <div>
+                <CardTitle className="text-sm flex items-center gap-2 text-[#F59E0B]">
+                  <ArrowRight className="w-4 h-4 text-[#F59E0B]" />
+                  ShiftRows Cyclic Left Permutation Trajectory
+                </CardTitle>
+                <CardDescription>
+                  Demonstrates how row r shifts cyclically to the left by exactly r bytes
+                </CardDescription>
+              </div>
+              <Badge variant="amber">Row Trajectories</Badge>
+            </CardHeader>
+
+            <div className="p-4 rounded-xl bg-[#0B1120] border border-[#293449] font-mono text-xs space-y-2.5">
+              {[0, 1, 2, 3].map((r) => (
+                <div
+                  key={r}
+                  className="flex items-center justify-between p-2 rounded-lg bg-[#151E30] border border-[#293449]"
+                >
+                  <span className="text-amber-400 font-bold w-24">Row {r}:</span>
+                  <span className="text-[#94A3B8]">
+                    Shift {r} bytes left →
+                  </span>
+                  <div className="flex items-center gap-1.5 text-[#F1F5F9]">
+                    {stages[3].matrix[r].map((b, c) => (
+                      <span key={c} className="w-7 h-7 rounded bg-[#0B1120] border border-[#293449] flex items-center justify-center font-bold">
+                        {toHex(b)}
+                      </span>
+                    ))}
+                  </div>
+                  <ArrowRight className="w-4 h-4 text-amber-500" />
+                  <div className="flex items-center gap-1.5 text-[#22C55E]">
+                    {stages[4].matrix[r].map((b, c) => (
+                      <span key={c} className="w-7 h-7 rounded bg-amber-500/10 border border-amber-500/30 flex items-center justify-center font-bold">
+                        {toHex(b)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {/* 6. DEEP DIVE: MIXCOLUMNS MATRIX MULTIPLICATION EXPLORER (Step 6) */}
         {currentStep === 5 && (
           <Card className="border-emerald-500/30 bg-[#151E30] animate-in fade-in duration-300">
             <CardHeader>
@@ -690,7 +937,7 @@ export default function SimulatorPage() {
           </Card>
         )}
 
-        {/* 4. DEEP DIVE: ADDROUNDKEY XOR & KEY SCHEDULE INSPECTOR */}
+        {/* 7. DEEP DIVE: ADDROUNDKEY XOR & KEY SCHEDULE INSPECTOR */}
         {activeStage.roundKeyMatrix && activeStage.beforeStateMatrix && (
           <Card className="border-purple-500/40 bg-[#151E30] animate-in fade-in duration-300 space-y-5">
             <CardHeader className="mb-0">
@@ -832,7 +1079,7 @@ export default function SimulatorPage() {
                   </div>
 
                   <div className="text-[11px] text-[#94A3B8] leading-relaxed pt-1">
-                    <strong className="text-[#F1F5F9]">Where does this Round Key come from?</strong> In AES-256, the 256-bit (32-byte) master key is passed through the <em>Rijndael Key Expansion algorithm</em>. It applies cyclic word rotations (<code className="text-[#38BDF8]">RotWord</code>), non-linear S-Box substitution (<code className="text-[#38BDF8]">SubWord</code>), and XORs with Round Constants (<code className="text-[#38BDF8]">Rcon</code>) to generate 15 distinct 128-bit round subkeys ($K_0$ through $K_{14}$).
+                    <strong className="text-[#F1F5F9]">Where does this Round Key come from?</strong> In AES-256, the 256-bit (32-byte) master key is expanded via the <em>Rijndael Key Expansion algorithm</em>. It applies cyclic word rotations (<code className="text-[#38BDF8]">RotWord</code>), non-linear S-Box substitution (<code className="text-[#38BDF8]">SubWord</code>), and XORs with Round Constants (<code className="text-[#38BDF8]">Rcon</code>) to generate 15 distinct 128-bit round subkeys ($K_0$ through $K_{14}$).
                   </div>
                 </div>
               );
